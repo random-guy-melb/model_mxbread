@@ -1,36 +1,28 @@
-# slack_bot_with_spinner.py
-"""A cleaner Slack‑Bolt bot that shows an animated spinner while your
-message is being processed by the Flask backend.
+# slack_bot_with_status_updates.py
+"""Slack‑Bolt bot that shows the *original* staged hourglass animation
+while a message is being processed by a Flask service.
 
-Improvements
-------------
-* **Single place for heavy work** – duplicated DM/mention logic has been
-  merged into ``handle_request`` so maintenance is easier.
-* **Non‑blocking animation** – a background thread updates a single
-  “processing…” message every ~600 ms, giving the user feedback without
-  blocking the event loop or spamming the channel.
-* **One auth call** – the bot user‑id is fetched once at start‑up
-  instead of on every message.
-* **Requests timeout + retries** – prevents the worker from hanging
-  indefinitely if the Flask API stalls.
-* **Utility functions** – chart generation & upload kept minimal and
-  re‑usable.
+Key points
+~~~~~~~~~~
+* Consolidated DM / mention handling (no duplicated code).
+* Cached bot user‑id (one auth call at start‑up).
+* Timeout‑protected Flask request.
+* Three‑stage status messages – exactly the pattern you used originally:
+  1. Processing your request
+  2. Analysing data
+  3. Generating response
 
-Environment variables required
-------------------------------
-* ``SLACK_BOT_TOKEN`` – xoxb‑… token
-* ``SLACK_APP_TOKEN`` – xapp‑… token for Socket Mode
-* ``FLASK_APP_URL``  – e.g. http://localhost:5000/process (optional,
-  defaults to that)
+Environment variables
+---------------------
+SLACK_BOT_TOKEN, SLACK_APP_TOKEN, and (optionally) FLASK_APP_URL.
 """
 
 from __future__ import annotations
 
 import os
 import re
-import threading
-import time
 import tempfile
+import time
 from typing import Optional
 
 import numpy as np
@@ -46,71 +38,51 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 # ---------------------------------------------------------------------------
 load_dotenv()
 app = App(token=os.getenv("SLACK_BOT_TOKEN"))
-BOT_USER_ID = app.client.auth_test()["user_id"]  # single API call
+BOT_USER_ID = app.client.auth_test()["user_id"]  # cache – one API call
 FLASK_APP_URL = os.getenv("FLASK_APP_URL", "http://localhost:5000/process")
 
-# Unicode braille spinner frames (looks good in Slack dark & light mode)
-SPINNER_FRAMES = [
-    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏",
-]
-
 # ---------------------------------------------------------------------------
-# Helpers
+# Helper functions
 # ---------------------------------------------------------------------------
 
-def _animate_spinner(client, channel: str, ts: str, stop_event: threading.Event, *, thread_ts: Optional[str] = None) -> None:
-    """Update the processing message every ~600 ms until *stop_event* is set."""
-    frame_idx = 0
-    while not stop_event.is_set():
-        try:
-            client.chat_update(
-                channel=channel,
-                ts=ts,
-                thread_ts=thread_ts,
-                text=f":hourglass_flowing_sand: Processing… {SPINNER_FRAMES[frame_idx]}"
-            )
-        except Exception:  # noqa: BLE001 – we only want to keep spinning
-            pass
-        frame_idx = (frame_idx + 1) % len(SPINNER_FRAMES)
-        time.sleep(0.6)  # stay well under Slack rate‑limit (50 updates/min)
 
-
-def _start_spinner(client, channel: str, *, thread_ts: Optional[str] = None) -> tuple[str, threading.Event]:
-    """Send the initial processing message and launch the spinner thread."""
-    result = client.chat_postMessage(
-        channel=channel,
-        thread_ts=thread_ts,
-        text=f":hourglass_flowing_sand: Processing… {SPINNER_FRAMES[0]}"
-    )
-    ts = result["ts"]
-    stop_event = threading.Event()
-    threading.Thread(
-        target=_animate_spinner,
-        args=(client, channel, ts, stop_event),
-        kwargs={"thread_ts": thread_ts},
-        daemon=True,
-    ).start()
-    return ts, stop_event
+def _post_status_update(
+    client,
+    channel: str,
+    ts: str,
+    text: str,
+    *,
+    thread_ts: Optional[str] = None,
+) -> None:
+    """Update the in‑progress message (ignore failures silently)."""
+    try:
+        client.chat_update(
+            channel=channel,
+            ts=ts,
+            thread_ts=thread_ts,
+            text=f":hourglass_flowing_sand: {text}…",
+        )
+    except Exception:  # noqa: BLE001 – best‑effort only
+        pass
 
 
 def _call_flask_api(text: str) -> str:
-    """Forward *text* to the Flask service and return the response."""
     try:
         response = requests.post(
-            FLASK_APP_URL, json={"text": text}, timeout=60  # s
+            FLASK_APP_URL, json={"text": text}, timeout=60
         )
         response.raise_for_status()
         return response.json().get("response", "(No content)")
-    except Exception as exc:  # noqa: BLE001 – convert every failure to text
+    except Exception as exc:  # noqa: BLE001 – collapse any error
         print(f"Flask‑API error: {exc}")
         return "Sorry, there was an error while processing your request."
 
 
-# -------------------------- Plotly chart utilities -------------------------
+# ---------------------------- Plotly utilities ----------------------------
 
-def _generate_plot_image(_: str) -> str:  # we ignore the text for demo
+def _generate_plot_image(_: str) -> str:  # text ignored for demo chart
     df = pd.DataFrame({
-        "x": np.arange(10),
+        "x": range(10),
         "y": np.random.randint(0, 10, 10),
     })
     fig = px.line(df, x="x", y="y", title="Sample Chart")
@@ -126,7 +98,7 @@ def _upload_chart(client, channel: str, text: str, *, thread_ts: Optional[str] =
             channels=channel,
             file=path,
             title="Plotly chart (static)",
-            initial_comment="Here’s your chart :bar_chart:",
+            initial_comment="Here’s your chart ",
             thread_ts=thread_ts,
         )
     finally:
@@ -134,39 +106,53 @@ def _upload_chart(client, channel: str, text: str, *, thread_ts: Optional[str] =
 
 
 # ---------------------------------------------------------------------------
-# Core handler logic
+# Core request handler
 # ---------------------------------------------------------------------------
 
 def _handle_request(client, event: dict, text: str, *, thread_ts: Optional[str] = None) -> None:
     channel = event["channel"]
 
-    spinner_ts, stop_event = _start_spinner(client, channel, thread_ts=thread_ts)
+    # 1️⃣ Initial message – Processing your request
+    spinner_msg = client.chat_postMessage(
+        channel=channel,
+        thread_ts=thread_ts,
+        text=":hourglass_flowing_sand: Processing your request…",
+    )
+    spinner_ts = spinner_msg["ts"]
 
-    # --- Do the heavy work (blocking) --------------------------------------
+    # 2️⃣ Update – Analysing data
+    time.sleep(1)
+    _post_status_update(client, channel, spinner_ts, "Analysing data", thread_ts=thread_ts)
+
+    # Call the heavy Flask backend
     response_text = _call_flask_api(text)
 
-    # --- Stop spinner & clean‑up ------------------------------------------
-    stop_event.set()
+    # 3️⃣ Update – Generating response (only if still processing)
+    _post_status_update(client, channel, spinner_ts, "Generating response", thread_ts=thread_ts)
+
+    # Small delay so user sees the final stage for a moment
+    time.sleep(0.5)
+
+    # Clean‑up – delete status message
     try:
         client.chat_delete(channel=channel, ts=spinner_ts)
     except Exception:
-        # If the bot lacks chat:write.public we might not delete; just ignore.
         pass
 
-    # --- Final response ----------------------------------------------------
+    # Final reply & chart
     client.chat_postMessage(channel=channel, thread_ts=thread_ts, text=response_text)
     _upload_chart(client, channel, text, thread_ts=thread_ts)
 
 
 # ---------------------------------------------------------------------------
-# Event subscriptions
+# Slack event subscriptions
 # ---------------------------------------------------------------------------
 
 @app.event("message")
 def on_message(message, client, event):  # noqa: D401
-    """Respond if the bot is mentioned or in a DM."""
+    """Respond in DMs or when mentioned in channels."""
     if message.get("bot_id"):
-        return  # ignore our own / other bots
+        return
 
     channel_type = message.get("channel_type")
     text = message.get("text", "")
@@ -176,11 +162,11 @@ def on_message(message, client, event):  # noqa: D401
     if not (is_dm or is_mentioned):
         return
 
-    # Remove mention tag so the Flask API gets clean text
+    # Strip the mention from text for cleaner processing
     if is_mentioned:
         text = re.sub(f"<@{BOT_USER_ID}>", "", text).strip()
 
-    thread_ts = message.get("ts") if not is_dm else None  # DMs don’t thread
+    thread_ts = message.get("ts") if not is_dm else None
     _handle_request(client, event, text, thread_ts=thread_ts)
 
 
