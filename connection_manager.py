@@ -48,6 +48,13 @@ class ConnectionManager:
         threading.Thread(target=self._cleanup_loop, daemon=True).start()
         logger.info("ConnectionManager initialised (idle-timeout: %ss)", timeout_seconds)
 
+    def set_timeout(self, seconds: int) -> None:
+        if seconds <= 0:
+            raise ValueError("timeout must be a positive integer")
+        with self._lock:
+            self._timeout = seconds
+        logger.info("Idle-timeout changed to %ss", seconds)
+
     @retry(wait=wait_exponential(multiplier=1, min=4, max=10),
            stop=stop_after_attempt(3),
            retry=retry_if_exception_type((ConnectionError, TimeoutError)))
@@ -114,10 +121,14 @@ class ConnectionManager:
                 for key in to_remove:
                     self._connections.pop(key, None)
 
-            time.sleep(1)   # one-second granularity is enough
+            time.sleep(1)
 
 class AzureOpenAIClient:
     _manager = ConnectionManager()
+
+    @classmethod
+    def set_idle_timeout(cls, seconds: int) -> None:
+        cls._manager.set_timeout(seconds)
 
     # Return a cached client for the requested version
     @classmethod
